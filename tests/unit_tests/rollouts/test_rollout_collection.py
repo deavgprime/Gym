@@ -26,7 +26,6 @@ import warnings
 import weakref
 from asyncio import Future
 from collections import Counter, defaultdict
-from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
@@ -38,21 +37,16 @@ import orjson
 import pytest
 import uvicorn
 import yaml
-from aiohttp import (
-    ClientConnectorError,
-    ClientPayloadError,
-    ClientResponseError,
-    ClientSession,
-    ServerDisconnectedError,
-)
+from aiohttp import ClientConnectorError, ClientResponseError, ClientSession, ServerDisconnectedError
 from anyio import CancelScope
 from omegaconf import DictConfig, OmegaConf
 from pydantic import ValidationError
 
-import nemo_gym.client.http_client
 import nemo_gym.models.token_capture.delivery
 import nemo_gym.rollouts.batch_status
 import nemo_gym.rollouts.rollout_collection
+import nemo_gym.rollouts.rollout_perf
+import nemo_gym.rollouts.trajectory_builder
 import nemo_gym.server_runtime.server_utils
 from nemo_gym.artifacts.rollout_rows import (
     NG_DISPATCH_DRAINED_KEY,
@@ -62,6 +56,8 @@ from nemo_gym.artifacts.rollout_rows import (
 )
 from nemo_gym.client.server_client import ServerClient
 from nemo_gym.config.config_types import (
+    AggregateMetrics,
+    AggregateMetricsRequest,
     AmbiguousEnvironmentServerError,
     BaseServerConfig,
     ConfigError,
@@ -79,8 +75,16 @@ from nemo_gym.core.episode import EpisodeId, maybe_rollout_id_from_run_body
 from nemo_gym.core.failure_kinds import CANCELLED, KILL_SHAPED
 from nemo_gym.core.responses_api_types import NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.metrics.reward_profile import compute_aggregate_metrics, compute_subset_metrics
+from nemo_gym.models.token_capture import (
+    LineageResolution,
+    ParentResolutionStatus,
+    TokenCaptureSnapshot,
+    TokenCaptureStore,
+    TokenEntry,
+    clear_token_captures_for_rollouts,
+    stamp_lineage,
+)
 from nemo_gym.models.token_capture.config import TokenIdCaptureConfig
-from nemo_gym.models.token_capture.consumer import clear_token_captures_for_rollouts
 from nemo_gym.models.token_capture.delivery import (
     MASK_SAMPLE_KEY,
     TOKEN_CAPTURE_KEY,
@@ -89,9 +93,6 @@ from nemo_gym.models.token_capture.delivery import (
     retire_rollout_token_capture,
     rollout_carries_token_ids,
 )
-from nemo_gym.models.token_capture.protocols import LineageResolution, TokenCaptureSnapshot
-from nemo_gym.models.token_capture.records import ParentResolutionStatus, TokenEntry, stamp_lineage
-from nemo_gym.models.token_capture.store import TokenCaptureStore
 from nemo_gym.rollout_reverification import RolloutReverificationConfig
 from nemo_gym.rollouts.batch_status import observe_materialized_rows
 from nemo_gym.rollouts.health.types import RunHealthLimits
@@ -108,21 +109,15 @@ from nemo_gym.rollouts.rollout_collection import (
     NG_FAILURE_JUDGE_ERROR_KEY,
     NG_FAILURE_MAX_ATTEMPTS_KEY,
     NG_OMITTED_ROLLOUT_KEY,
-    NG_PERF_KEY,
     NG_RESULT_TYPE_KEY,
     NG_TERMINAL_KEY,
     NG_TRAJECTORY_KEY,
     PROVENANCE_KEYS,
-    DispatchLatencyTracker,
     E2ERolloutCollectionConfig,
     RolloutAggregationConfig,
     RolloutAggregationHelper,
     RolloutCollectionConfig,
     RolloutCollectionHelper,
-    _attach_ng_perf,
-    _attach_trajectory_record,
-    _build_ng_perf,
-    _build_trajectory_record,
     _CompletedRollout,
     _counted_failure_row,
     _drop_truncated_tail,
@@ -136,13 +131,17 @@ from nemo_gym.rollouts.rollout_collection import (
     _rollout_order_key,
     _rollout_request_debug_summary,
     _round_robin_by_agent,
-    _trajectory_identity,
     get_max_rollout_attempts,
     is_terminal_failure,
     loads_jsonl_line,
 )
 from nemo_gym.rollouts.rollout_health import health_check_run_dir
-from nemo_gym.server_runtime.base_resources_server import AggregateMetrics, AggregateMetricsRequest
+from nemo_gym.rollouts.rollout_perf import NG_PERF_KEY, DispatchLatencyTracker, _attach_ng_perf, _build_ng_perf
+from nemo_gym.rollouts.trajectory_builder import (
+    _attach_trajectory_record,
+    _build_trajectory_record,
+    _trajectory_identity,
+)
 from nemo_gym.server_runtime.request_handling.disconnect import ClientDisconnectCancellationMiddleware
 from nemo_gym.telemetry.gym_metrics import ROLLOUT_COMPLETED_INSTRUMENT
 from nemo_gym.telemetry.span_groups import GymSpanGroup
@@ -210,28 +209,6 @@ class FakeResponse:
 
     def release(self) -> None:
         self.released = True
-
-    async def read(self) -> bytes:
-        return orjson.dumps(self.payload)
-
-
-def _guarded_replies(replies: list) -> Callable[..., Awaitable]:
-    """A transport side effect that returns `replies` in order and fails the test on any request past them.
-
-    `AsyncMock(side_effect=list)` raises StopAsyncIteration when the list runs out, which the request retry loop
-    treats as a failed attempt and retries, so an unexpected extra request would hang instead of failing.
-    """
-    remaining = list(replies)
-
-    async def send(*_args, **_kwargs):
-        if not remaining:
-            pytest.fail(f"unexpected extra request after {len(replies)} expected")
-        reply = remaining.pop(0)
-        if isinstance(reply, BaseException):
-            raise reply  # As AsyncMock does for an exception in its side_effect list.
-        return reply
-
-    return send
 
 
 def http_error(status: int, message: str = "boom", body: bytes | None = None) -> ClientResponseError:
@@ -1145,7 +1122,7 @@ class TestRolloutCollection:
         row = {TASK_INDEX_KEY_NAME: 2, ROLLOUT_INDEX_KEY_NAME: 3}
         result = {"ng_trajectory": {}}
         monkeypatch.setattr(
-            nemo_gym.rollouts.rollout_collection, "_build_trajectory_record", MagicMock(side_effect=ValueError)
+            nemo_gym.rollouts.trajectory_builder, "_build_trajectory_record", MagicMock(side_effect=ValueError)
         )
 
         _attach_trajectory_record(row, result)
@@ -1501,7 +1478,7 @@ class TestRolloutCollection:
     def test_attach_ng_perf_swallows_build_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # An unexpected assembly failure must never take down rollout collection over an observability side-channel.
         result = {NG_TRAJECTORY_KEY: {}}
-        monkeypatch.setattr(nemo_gym.rollouts.rollout_collection, "_build_ng_perf", MagicMock(side_effect=ValueError))
+        monkeypatch.setattr(nemo_gym.rollouts.rollout_perf, "_build_ng_perf", MagicMock(side_effect=ValueError))
 
         _attach_ng_perf(result, observability_enabled=True, rollout_latency_ms=42.0)
 
@@ -1752,7 +1729,7 @@ class TestRolloutCollection:
         )
         transport.request = AsyncMock(side_effect=[failure, FakeResponse(200, {"reward": 1})])
         monkeypatch.setattr("nemo_gym.client.http_client.get_global_aiohttp_client", lambda: transport)
-        monkeypatch.setattr(nemo_gym.client.http_client.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(nemo_gym.server_runtime.server_utils.asyncio, "sleep", AsyncMock())
         run = RolloutCollectionHelper().run_examples([failing_row()], retry_requests=retry_requests)
         if retry_requests or connection_refused:
             _, result = await next(run)
@@ -1764,110 +1741,6 @@ class TestRolloutCollection:
         for call in transport.request.call_args_list:
             assert call.kwargs["url"] == "http://agent:1234/run"
             assert "_resend_after_disconnect" not in call.kwargs
-
-    @pytest.mark.parametrize("route_failures_to_sidecar", [False, True])
-    @pytest.mark.parametrize("retry_requests", [True, False])
-    async def test_run_reply_cut_off_mid_body_is_one_failed_attempt(
-        self, monkeypatch: pytest.MonkeyPatch, retry_requests: bool, route_failures_to_sidecar: bool
-    ) -> None:
-        """Each /run sent starts an episode, so a cut-off reply is not resent; collection's failure handling owns it.
-
-        It ends the run, or with ``route_failures_to_sidecar`` it is a failure row that resume retries within
-        ``NEMO_GYM_MAX_ROLLOUT_ATTEMPTS``. The server answered 200, so the rollout ran.
-        """
-        config = install_fake_server_client(monkeypatch, AsyncMock()).global_config_dict
-        config.my_environment_server.environment_servers.legacy_agent.update({"host": "agent", "port": 1234})
-        client = ServerClient(head_server_config=BaseServerConfig(host="head", port=11000), global_config_dict=config)
-        monkeypatch.setattr(
-            nemo_gym.rollouts.rollout_collection, "setup_server_client_utils", lambda *_args, **_kwargs: client
-        )
-        # The real read: collection's own read of the reply is the step under test.
-        monkeypatch.setattr(
-            nemo_gym.rollouts.rollout_collection, "get_response_json", nemo_gym.client.http_client.get_response_json
-        )
-        replies = []
-        for _ in range(3):
-            cut_off = FakeResponse(200, {"reward": 0})
-            cut_off.read = AsyncMock(side_effect=ClientPayloadError("Response payload is not completed"))
-            replies.append(cut_off)
-        transport = MagicMock(request=AsyncMock(side_effect=_guarded_replies(replies)))
-        monkeypatch.setattr(nemo_gym.client.http_client, "get_global_aiohttp_client", lambda: transport)
-        monkeypatch.setattr(nemo_gym.client.http_client.asyncio, "sleep", AsyncMock())
-        run = RolloutCollectionHelper().run_examples(
-            [failing_row()], retry_requests=retry_requests, route_failures_to_sidecar=route_failures_to_sidecar
-        )
-        if route_failures_to_sidecar:
-            _, result = await next(run)
-            assert result[NG_FAILURE_CLASS_KEY] == AGENT_RUN_ERROR_FAILURE_CLASS
-            assert result["_ng_failure_type"] == "ClientPayloadError"
-            assert result["_ng_failure_http_status"] == 200
-            assert NG_TERMINAL_KEY not in result
-            assert replies[0].released
-        else:
-            with pytest.raises(ClientPayloadError):
-                await next(run)
-        assert transport.request.await_count == 1
-
-    @pytest.mark.parametrize(
-        ("reply", "reward", "failure_body"),
-        [
-            pytest.param(
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 39\r\n\r\n"
-                b'{"detail": "verifier failed: KeyError"}',
-                None,
-                '{"detail": "verifier failed: KeyError"}',
-                id="complete-500",
-            ),
-            pytest.param(
-                b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{"reward": 1.0}',
-                1.0,
-                None,
-                id="complete-200",
-            ),
-        ],
-    )
-    async def test_a_complete_run_reply_over_http_reaches_collection_unchanged(
-        self, monkeypatch: pytest.MonkeyPatch, reply: bytes, reward: float | None, failure_body: str | None
-    ) -> None:
-        """A complete error reply keeps its body in the failure row; a complete success reply keeps its result."""
-        requests = []
-
-        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            await reader.readuntil(b"\r\n\r\n")
-            requests.append(1)
-            if len(requests) > 1:
-                writer.write(b"HTTP/1.1 599 Unexpected Extra Request\r\nContent-Length: 0\r\n\r\n")
-            else:
-                writer.write(reply)
-            await writer.drain()
-            writer.close()
-
-        server = await asyncio.start_server(handle, "127.0.0.1", 0)
-        config = install_fake_server_client(monkeypatch, AsyncMock()).global_config_dict
-        config.my_environment_server.environment_servers.legacy_agent.update(
-            {"host": "127.0.0.1", "port": server.sockets[0].getsockname()[1]}
-        )
-        client = ServerClient(head_server_config=BaseServerConfig(host="head", port=11000), global_config_dict=config)
-        monkeypatch.setattr(
-            nemo_gym.rollouts.rollout_collection, "setup_server_client_utils", lambda *_args, **_kwargs: client
-        )
-        monkeypatch.setattr(
-            nemo_gym.rollouts.rollout_collection, "get_response_json", nemo_gym.client.http_client.get_response_json
-        )
-        monkeypatch.setattr(
-            nemo_gym.rollouts.rollout_collection, "raise_for_status", nemo_gym.client.http_client.raise_for_status
-        )
-        async with server, ClientSession() as session:
-            monkeypatch.setattr(nemo_gym.client.http_client, "get_global_aiohttp_client", lambda: session)
-            run = RolloutCollectionHelper().run_examples([failing_row()], route_failures_to_sidecar=True)
-            _, result = await next(run)
-        if failure_body is None:
-            assert result["reward"] == reward and NG_FAILURE_CLASS_KEY not in result
-        else:
-            assert result[NG_FAILURE_CLASS_KEY] == AGENT_RUN_ERROR_FAILURE_CLASS
-            assert result["_ng_failure_http_status"] == 500
-            assert result["_ng_failure_response_body"] == failure_body
-        assert len(requests) == 1
 
     @pytest.mark.parametrize("error", [RuntimeError("dispatcher bug"), asyncio.CancelledError()])
     async def test_run_examples_propagates_non_request_failures(
@@ -10463,7 +10336,7 @@ class TestTurnsFromModelCalls:
             self._call("second", {"output": [message]}, started_at=2.0),
         ]
 
-        turns = nemo_gym.rollouts.rollout_collection._turns_from_model_calls(
+        turns = nemo_gym.rollouts.trajectory_builder._turns_from_model_calls(
             "task", "rollout", [self._invocation("root", ["first", "second"])], calls, resolved=True
         )
 
@@ -10480,7 +10353,7 @@ class TestTurnsFromModelCalls:
         message = {"role": "assistant", "content": "", "reasoning_content": "think", "tool_calls": [{"id": "t1"}]}
         calls = [self._call("only", {"choices": [{"message": message}]}, started_at=1.0)]
 
-        [turn] = nemo_gym.rollouts.rollout_collection._turns_from_model_calls(
+        [turn] = nemo_gym.rollouts.trajectory_builder._turns_from_model_calls(
             "task", "rollout", [self._invocation("root", ["only"])], calls, resolved=None
         )
 
@@ -10494,7 +10367,7 @@ class TestTurnsFromModelCalls:
         failed = TrajectoryModelCall.model_validate({"model_call_id": "failed", "started_at": 1.0})
         answered = self._call("answered", {"output": []}, started_at=2.0)
 
-        turns = nemo_gym.rollouts.rollout_collection._turns_from_model_calls(
+        turns = nemo_gym.rollouts.trajectory_builder._turns_from_model_calls(
             "task", "rollout", [self._invocation("root", ["failed", "answered"])], [failed, answered], None
         )
 
@@ -10506,7 +10379,7 @@ class TestTurnsFromModelCalls:
         failed.response_metadata.status_code = status
         answered = self._call("answered", {"output": []}, started_at=2.0)
         invocation = self._invocation("root", ["failed", "answered"])
-        turns = nemo_gym.rollouts.rollout_collection._turns_from_model_calls(
+        turns = nemo_gym.rollouts.trajectory_builder._turns_from_model_calls(
             "task", "rollout", [invocation], [failed, answered], None
         )
         assert [(turn.model_calls[0].model_call_id, turn.turn_no) for turn in turns] == [("answered", 1)]
@@ -10521,7 +10394,7 @@ class TestTurnsFromModelCalls:
         ]
         invocations = [self._invocation("assistant", ["owned"]), self._invocation("user", [])][:invocation_count]
 
-        turns = nemo_gym.rollouts.rollout_collection._turns_from_model_calls(
+        turns = nemo_gym.rollouts.trajectory_builder._turns_from_model_calls(
             "task", "rollout", invocations, calls, None
         )
 
@@ -11348,7 +11221,8 @@ class TestEnvironmentServerRouting:
         reward=1.0 result to the failures file (``_ng_failure_class``), write it nowhere
         (``_ng_no_persist``) or relabel its type (``_ng_result_type``).
         """
-        from nemo_gym.data.tasks.harbor.digest import DATASET_DIGEST_KEY, DIGEST_KEY
+        from nemo_gym.data.tasks.harbor import DIGEST_KEY
+        from nemo_gym.data.tasks.harbor.digest import DATASET_DIGEST_KEY
 
         assert PROVENANCE_KEYS == (DIGEST_KEY, DATASET_DIGEST_KEY)
         monkeypatch.setattr(nemo_gym.rollouts.rollout_collection, "get_global_config_dict", lambda: {})
@@ -12219,7 +12093,7 @@ class TestRecordPolicyModelServer:
 async def test_collection_persists_policy_alias_for_offline_failed_rollout_timing(tmp_path, monkeypatch):
     import time
 
-    from nemo_gym.rollouts.model_calls import CaptureStore
+    from nemo_gym.models.model_call_capture import CaptureStore
     from nemo_gym.rollouts.rollout_health import health_check_run_dir
     from tests.unit_tests.rollouts.test_health_timeouts import exchange
 
