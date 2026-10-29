@@ -74,6 +74,7 @@ from nemo_gym.config.global_config import (
 from nemo_gym.core.episode import EpisodeId, maybe_rollout_id_from_run_body
 from nemo_gym.core.failure_kinds import CANCELLED, KILL_SHAPED
 from nemo_gym.core.responses_api_types import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.eval.rollout_reverification import RolloutReverificationConfig
 from nemo_gym.metrics.reward_profile import compute_aggregate_metrics, compute_subset_metrics
 from nemo_gym.models.token_capture import (
     LineageResolution,
@@ -93,7 +94,6 @@ from nemo_gym.models.token_capture.delivery import (
     retire_rollout_token_capture,
     rollout_carries_token_ids,
 )
-from nemo_gym.rollout_reverification import RolloutReverificationConfig
 from nemo_gym.rollouts.batch_status import observe_materialized_rows
 from nemo_gym.rollouts.health.types import RunHealthLimits
 from nemo_gym.rollouts.rollout_collection import (
@@ -12332,7 +12332,7 @@ class TestSidecarReadersSkipOmittedRows:
         assert (accounting["expected"], accounting["missing"]) == (3, 2)
 
     def test_rollout_compare_leaves_them_out(self, tmp_path: Path) -> None:
-        from nemo_gym.rollout_compare.rows import load_rollouts
+        from nemo_gym.eval.rollout_compare.rows import load_rollouts
 
         assert [row[TASK_INDEX_KEY_NAME] for row in load_rollouts(self._output(tmp_path))] == [0]
 
@@ -12415,7 +12415,7 @@ class TestOmittedRowsAndTheLatestAttempt:
         assert (accounting["expected"], accounting["missing"]) == (3, 1)
 
     def test_rollout_compare(self, tmp_path: Path) -> None:
-        from nemo_gym.rollout_compare.rows import load_rollouts
+        from nemo_gym.eval.rollout_compare.rows import load_rollouts
 
         assert [row[TASK_INDEX_KEY_NAME] for row in load_rollouts(self._output(tmp_path))] == [1, 2]
 
