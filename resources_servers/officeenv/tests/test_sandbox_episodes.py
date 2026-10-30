@@ -35,6 +35,8 @@ from nemo_gym.server_utils import ServerClient
 from nemo_gym.testing.session_conformance import check_resources_session_contract
 from resources_servers.officeenv import app as officeenv_app
 from resources_servers.officeenv.app import (
+    ATTACHMENT_DOWNLOADS,
+    ATTACHMENT_UPLOADS,
     CONTENT_DOWNLOADS,
     CONTENT_UPLOADS,
     RELAY_PATH,
@@ -161,6 +163,9 @@ class FakeSandbox:
     fail_on: str | None = None  # "start", "serialize", "upload" or "stop": that step raises
     refusing: tuple[str, ...] = ()  # commands that start with one of these exit 1
     on_stop: Callable[[], None] | None = None  # runs as a sandbox stops
+    on_download: Callable[[], None] | None = None  # runs as a file is downloaded from a sandbox
+    links: dict[str, str] = {}  # sandbox paths that hold a link, and the path it points to
+    folders: set[str] = set()  # sandbox paths that hold a folder
 
     def __init__(self, provider_config: dict) -> None:
         self.provider_config = provider_config
@@ -189,6 +194,20 @@ class FakeSandbox:
         self.files[remote_path] = Path(local_path).read_bytes()
         self.modes[remote_path] = stat.S_IMODE(os.stat(local_path).st_mode)
 
+    async def download(self, remote_path: str, local_path) -> None:
+        """A file the server wrote, or the test as the model; a link or a folder is copied as it is, as ``docker cp``
+        copies them."""
+        if FakeSandbox.on_download is not None:
+            FakeSandbox.on_download()
+        if remote_path in FakeSandbox.links:
+            os.symlink(FakeSandbox.links[remote_path], local_path)
+        elif remote_path in FakeSandbox.folders:
+            os.mkdir(local_path)
+        elif remote_path in self.files:
+            Path(local_path).write_bytes(self.files[remote_path])
+        else:
+            raise FileNotFoundError(remote_path)
+
     async def serialize(self) -> dict:
         if FakeSandbox.fail_on == "serialize":
             raise RuntimeError("the provider cannot describe the sandbox")
@@ -205,7 +224,7 @@ class FakeSandbox:
 @pytest.fixture
 def sandboxes(monkeypatch) -> type[FakeSandbox]:
     FakeSandbox.started, FakeSandbox.stopped, FakeSandbox.fail_on, FakeSandbox.on_stop = [], [], None, None
-    FakeSandbox.refusing = ()
+    FakeSandbox.refusing, FakeSandbox.on_download, FakeSandbox.links, FakeSandbox.folders = (), None, {}, set()
     monkeypatch.setattr(officeenv_app, "AsyncSandbox", FakeSandbox)
     monkeypatch.setattr(officeenv_app, "get_global_config_dict", lambda: {"sandbox": {"docker": {}}})
     return FakeSandbox
@@ -1051,6 +1070,186 @@ def test_file_apps_tools_and_the_guide_say_where_content_goes(sandboxes) -> None
         assert "SharePoint: parent required" in guide and "$COMPANY_API_URL/v1/files/<app>/<file id>" in guide
 
 
+# Gmail's attachments move through the workspace too.
+
+MAIL_FILES = {"/workspace/out/totals.xlsx": BOOK, "/workspace/notes.csv": LONG.encode()}  # as the model writes them
+MESSAGE = {"to": ["sam@example.com"], "subject": "Totals", "body": "Attached."}
+
+
+def with_mail(spec: dict) -> dict:
+    """``spec`` with Gmail connected: Alex's mailbox holds a message (M_LEDGER) carrying the workbook, the long CSV
+    and a short one."""
+    spec["apps"]["gmail"] = {
+        "data": {
+            "mailboxes": [{"email": ME, "name": "Alex Morgan"}],
+            "messages": [
+                {
+                    "id": "M_LEDGER",
+                    "owner": ME,
+                    "sender": "sam@example.com",
+                    "to": [ME],
+                    "subject": "Ledgers",
+                    "body": "All three attached.",
+                    "date": "2026-09-20T08:00:00Z",
+                    "labelIds": ["INBOX"],
+                    "attachments": [
+                        {"filename": "ledger.xlsx", "content_base64": BOOK_B64},
+                        {"filename": "ledger long.csv", "content": LONG},
+                        {"filename": "totals.csv", "content": SHORT},
+                    ],
+                }
+            ],
+        }
+    }
+    return spec
+
+
+def seed_mail(client: TestClient, sandboxes: type[FakeSandbox], files: dict | None = None) -> tuple:
+    """Seed with_mail(content_spec()), with ``files`` (MAIL_FILES) in the workspace as if the model had written them:
+    the seed's answer, a function that calls a tool over MCP and reads its JSON output, and the tools as listed."""
+    seeded = client.post("/seed_session", json=seed_body(with_mail(content_spec())))
+    assert seeded.status_code == 200, seeded.text
+    token = seeded.json()["resources_tools"]["headers"][NEMO_GYM_MCP_SESSION_TOKEN_HEADER]
+    sandboxes.started[-1].files.update(MAIL_FILES if files is None else files)
+
+    def call(tool: str, /, **arguments: object) -> dict:
+        result = rpc(client, "tools/call", {"name": tool, "arguments": arguments}, token).json()["result"]
+        return result.get("structuredContent") or json.loads(result["content"][0]["text"])
+
+    listed = rpc(client, "tools/list", {}, token).json()["result"]["tools"]
+    return seeded, call, {tool["name"]: tool for tool in listed}
+
+
+def test_a_mail_attachment_is_saved_in_the_workspace(sandboxes) -> None:
+    with mcp_client(make_server()) as client:
+        seeded, call, _ = seed_mail(client, sandboxes, files={})
+        (sandbox,) = sandboxes.started
+        book = call("gmail_get_attachment", message_id="M_LEDGER", attachment_id="ledger.xlsx")
+        folder = f"/workspace/gmail/M_LEDGER/{book['attachmentId']}"  # a message may hold two of one name
+        assert book["savedTo"] == f"{folder}/ledger.xlsx" and book["savedBytes"] == len(BOOK), book
+        assert not {"content", "contentBase64", "preview"} & set(book) and "binary content" in book["note"]
+        assert sandbox.files[book["savedTo"]] == BOOK and sandbox.modes[book["savedTo"]] == 0o644
+        long = call("gmail_get_attachment", message_id="M_LEDGER", attachment_id="ledger long.csv")
+        assert "content" not in long and LONG.startswith(long["preview"])
+        assert sandbox.files[long["savedTo"]] == LONG.encode()
+        short = call("gmail_get_attachment", message_id="M_LEDGER", attachment_id="totals.csv")
+        assert short["content"] == SHORT and sandbox.files[short["savedTo"]] == SHORT.encode()  # inline as well
+        result = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies).json()
+        assert result["sandbox_files_saved"] == 3.0
+        assert result["sandbox_bytes_saved"] == float(len(BOOK) + len(LONG) + len(SHORT))
+
+
+def test_a_message_attaches_a_workspace_file_by_its_path(sandboxes) -> None:
+    """The server reads the file from the sandbox before the call runs, and the message carries it byte for byte. A
+    relative path is in the workspace, and the attachment is named after the file unless the call names it."""
+    with mcp_client(make_server()) as client:
+        seeded, call, _ = seed_mail(client, sandboxes)
+        attachments = [{"path": "/workspace/out/totals.xlsx"}, {"path": "notes.csv", "filename": "Q3 notes.csv"}]
+        sent = call("gmail_send_message", **MESSAGE, attachments=attachments)
+        assert "error" not in sent, sent
+        listed = call("gmail_get_message", id=sent["id"])["attachments"]
+        assert [(a["filename"], a["size"]) for a in listed] == [
+            ("totals.xlsx", len(BOOK)),
+            ("Q3 notes.csv", len(LONG)),
+        ]
+        back = call("gmail_get_attachment", message_id=sent["id"], attachment_id="totals.xlsx")
+        assert sandboxes.started[0].files[back["savedTo"]] == BOOK  # through the message and back, byte for byte
+        # a draft takes them too, and update_draft replaces them
+        draft = call("gmail_create_draft", **MESSAGE, attachments=[{"path": "notes.csv"}])
+        assert "error" not in draft, draft
+        assert "error" not in call("gmail_update_draft", id=draft["id"], attachments=[{"path": "out/totals.xlsx"}])
+        final = call("gmail_send_draft", id=draft["id"])
+        assert [a["filename"] for a in call("gmail_get_message", id=final["id"])["attachments"]] == ["totals.xlsx"]
+        result = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies).json()
+        assert result["sandbox_files_attached"] == 4.0 and result["sandbox_uploads_refused"] == 0.0
+        assert result["sandbox_bytes_attached"] == float(2 * len(BOOK) + 2 * len(LONG))
+
+
+def test_pasted_or_unnamed_mail_attachments_are_refused_with_the_path_to_use(sandboxes) -> None:
+    with mcp_client(make_server()) as client:
+        seeded, call, _ = seed_mail(client, sandboxes)
+
+        def send(*attachments: object) -> dict:
+            return call("gmail_send_message", **MESSAGE, attachments=list(attachments))
+
+        pasted = send({"filename": "totals.xlsx", "content_base64": BOOK_B64})
+        assert "upload_from_workspace" in json.dumps(pasted) and "binary content" in refused_message(pasted), pasted
+        assert '{"path": "/workspace/totals.xlsx"}' in refused_message(pasted)
+        assert "text over 8192 bytes" in refused_message(send({"filename": "notes.csv", "content": LONG}))
+        unnamed = send("totals.xlsx")  # a filename alone
+        assert "attach_from_workspace" in json.dumps(unnamed), unnamed
+        assert '{"path": "/workspace/totals.xlsx"}' in refused_message(unnamed)
+        for path in ("/workspace/missing.xlsx", "/dev/zero", "../../proc/self/environ"):
+            assert "there is no file at" in refused_message(send({"path": path})), path
+        assert "path or its content, not both" in refused_message(send({"path": "notes.csv", "content": "a,b"}))
+        assert "error" not in send({"filename": "short.csv", "content": SHORT})  # short text still goes in the call
+        result = client.post("/verify", json=VERIFY_BODY, cookies=seeded.cookies).json()
+        assert result["sandbox_uploads_refused"] == 2.0 and result["sandbox_files_attached"] == 0.0
+
+
+def test_an_attachment_is_read_only_from_a_regular_file_of_the_sandbox(sandboxes, tmp_path, monkeypatch) -> None:
+    """``docker cp`` copies a link as a link, which the server would read on its own host: a link, like a folder, is
+    no file to attach, and neither is one over the upload limit."""
+    secret = tmp_path / "host.txt"
+    secret.write_text("a file of the host\n")
+    sandboxes.links, sandboxes.folders = {"/workspace/link.txt": str(secret)}, {"/workspace/out"}
+    server = make_server()
+    with mcp_client(server) as client:
+        _, call, _ = seed_mail(client, sandboxes)
+        for path in ("/workspace/link.txt", "/workspace/out"):
+            refused = call("gmail_send_message", **MESSAGE, attachments=[{"path": path}])
+            assert f"there is no file at {path}" in refused_message(refused), refused
+        monkeypatch.setattr(officeenv_app, "MAX_UPLOAD_BYTES", 8)
+        too_big = call("gmail_send_message", **MESSAGE, attachments=[{"path": "notes.csv"}])
+        assert "/workspace/notes.csv is over" in refused_message(too_big), too_big
+        messages = server.service.store.get("rs-1").world.collection("gmail", "messages").rows.values()
+        assert [row["subject"] for row in messages] == ["Ledgers"]  # nothing was sent
+
+
+def test_a_call_whose_verification_begins_while_its_attachments_are_read_is_refused(sandboxes) -> None:
+    server = make_server()
+    with mcp_client(server) as client:
+        seeded, _, _ = seed_mail(client, sandboxes)
+        sandboxes.on_download = lambda: setattr(server._episodes["rs-1"], "grading", True)
+        body = {**MESSAGE, "attachments": [{"path": "notes.csv"}]}
+        sent = client.post("/gmail_send_message", json=body, cookies=seeded.cookies)
+        assert sent.status_code == 409 and "its tools are closed" in sent.text
+        messages = server.service.store.get("rs-1").world.collection("gmail", "messages").rows.values()
+        assert [row["subject"] for row in messages] == ["Ledgers"]  # nothing was sent
+
+
+def test_mail_attachments_are_described_as_they_move_here(sandboxes) -> None:
+    catalog = tools_exposure_catalog()
+    with mcp_client(make_server()) as client:
+        _, _, listed = seed_mail(client, sandboxes)
+        for op in ("send_message", "create_draft", "update_draft"):
+            text = listed[f"gmail_{op}"]["inputSchema"]["properties"]["attachments"]["description"]
+            assert "{path, filename?, mimeType?} attaches a file from the workspace" in text, text
+            assert "content_base64" not in text and "at most 8192 bytes" in text and "/workspace/totals.xlsx" in text
+        got = listed["gmail_get_attachment"]["description"]
+        assert "saved in the workspace" in got and "contentBase64" not in got and "at most 8192 bytes" in got
+        assert listed["gmail_list_messages"]["description"] == catalog["gmail_list_messages"]["description"]
+        guide = sandboxes.started[0].spec.files["/workspace/README.md"]
+        assert guide == workspace_guide(8192, tuple(with_mail(content_spec())["apps"]))
+        assert "gmail/<message id>/<attachment id>/<name>" in guide and "(Gmail's get_attachment tool)" in guide
+        assert '{"path": "/workspace/totals.xlsx"}' in guide
+    assert "Mail attachments" not in workspace_guide(8192, ("gdrive",))  # an episode without Gmail
+    assert "Mail attachments" not in workspace_guide(None, ("gmail",))  # content through the conversation
+
+
+def test_without_the_content_limit_mail_attachments_move_as_before(sandboxes) -> None:
+    with mcp_client(make_server(sandbox_config={**IMAGE, "inline_file_bytes": None})) as client:
+        _, call, listed = seed_mail(client, sandboxes)
+        got = call("gmail_get_attachment", message_id="M_LEDGER", attachment_id="ledger.xlsx")
+        assert got["contentBase64"] == BOOK_B64 and "savedTo" not in got
+        pasted = [{"filename": "t.xlsx", "content_base64": BOOK_B64}]
+        assert "error" not in call("gmail_send_message", **MESSAGE, attachments=pasted)
+        by_path = call("gmail_send_message", **MESSAGE, attachments=[{"path": "/workspace/out/totals.xlsx"}])
+        assert "unknown fields" in refused_message(by_path)  # Gmail's own answer: nothing reads the workspace here
+        schema = listed["gmail_send_message"]["inputSchema"]
+        assert "content_base64" in schema["properties"]["attachments"]["description"]  # OfficeEnv's
+
+
 # Guarding a server that sandboxes can reach.
 
 
@@ -1146,8 +1345,24 @@ ENVIRONMENT_NAMES = re.compile(
 )
 
 
+# Gmail's own vocabulary, which holds one of those words without naming the environment: its sendAs.verify
+# operation, and a send-as address that Gmail has verified
+VENDOR_WORDS = re.compile(r"gmail_verify_send_as|send-as addresses that is verified")
+
+
 def environment_names(text: str) -> set[str]:
-    return {found.group(0).lower() for found in ENVIRONMENT_NAMES.finditer(text)}
+    return {found.group(0).lower() for found in ENVIRONMENT_NAMES.finditer(VENDOR_WORDS.sub("", text))}
+
+
+# Gmail's calls that move attachments, as sandbox_view makes them: one saved, a workspace file attached, and
+# attachments refused (pasted, a filename alone, no such file)
+MAIL_CALLS = (
+    ("gmail_get_attachment", {"message_id": "M_LEDGER", "attachment_id": "ledger.xlsx"}),
+    ("gmail_send_message", {**MESSAGE, "attachments": [{"path": "/workspace/out/totals.xlsx"}]}),
+    ("gmail_send_message", {**MESSAGE, "attachments": [{"filename": "x.xlsx", "content_base64": "AAEC"}]}),
+    ("gmail_send_message", {**MESSAGE, "attachments": ["x.xlsx"]}),
+    ("gmail_send_message", {**MESSAGE, "attachments": [{"path": "/workspace/missing.xlsx"}]}),
+)
 
 
 def harness_model_url(*, token_capture: bool) -> str:
@@ -1164,14 +1379,16 @@ def sandbox_view(server: OfficeEnvResourcesServer, sandboxes: type[FakeSandbox])
     """Everything a sandboxed model can read of ``server``: its variables, the files and commands its sandbox gets,
     the MCP endpoint's name, header and tools, and the answers of every route a sandbox reaches, right and wrong
     (saved downloads, refused uploads, a tool outside the grant, the routes it may not use, the docs), with the
-    cookies they set, for each file app. The file apps' content tools are described by this server; OfficeEnv's
-    other descriptions are OfficeEnv's to check. Tokens are masked."""
+    cookies they set, for each file app and Gmail's attachments. The tools moving content are described by this
+    server; OfficeEnv's other descriptions are OfficeEnv's to check. Tokens are masked."""
     seen: list[str] = []
-    content_tools = {f"{app}_{op}" for app, op in CONTENT_DOWNLOADS | CONTENT_UPLOADS}
+    moving = CONTENT_DOWNLOADS | CONTENT_UPLOADS | ATTACHMENT_DOWNLOADS | ATTACHMENT_UPLOADS
+    content_tools = {f"{app}_{op}" for app, op in moving}
     with mcp_client(server) as local, mcp_client(server, client=SANDBOX) as remote:
-        seeded = local.post("/seed_session", json=seed_body(file_apps_spec()))
+        seeded = local.post("/seed_session", json=seed_body(with_mail(file_apps_spec())))
         assert seeded.status_code == 200, seeded.text
         (sandbox,) = sandboxes.started
+        sandbox.files.update(MAIL_FILES)
         token = sandbox.spec.env["COMPANY_API_TOKEN"]
         mcp = seeded.json()["resources_tools"]
         header, grant = next(iter(mcp["headers"].items()))
@@ -1200,6 +1417,7 @@ def sandbox_view(server: OfficeEnvResourcesServer, sandboxes: type[FakeSandbox])
             ("sharepoint_upload_content", {"drive_id": SP_DOCS, "path": "/Finance/x.csv", "content": LONG}),
             ("onedrive_get_content", {"item_id": "O_LONG"}),
             ("onedrive_upload_file", {"item_id": "O_LONG", "content": LONG}),
+            *MAIL_CALLS,
             ("slack_post_message", {"channel": "C1", "text": "hi"}),  # outside the grant
         ]:
             seen.append(mcp_call("tools/call", {"name": name, "arguments": arguments}, granted))
@@ -1255,6 +1473,9 @@ def test_a_sandbox_reads_environment_names_only_in_the_model_url(sandboxes) -> N
     text = sandbox_view(server, sandboxes)
     assert "COMPANY_API_URL=http://10.0.0.1:8080" in text and "/workspace/README.md" in text
     assert "savedTo" in text and "$COMPANY_API_URL/v1/files" in text  # a saved download, a refused pasted upload
+    # Gmail's attachments: one saved, and the refusals that name the workspace file to attach
+    assert "/workspace/gmail/M_LEDGER/" in text and "there is no file at /workspace/missing.xlsx" in text
+    assert "carries no content" in text and "attach it by its path" in text
     assert RELAY_PATH in text and server.get_session_cookie_name() in text  # the relay, a cookie an answer sets
     assert environment_names(text) == set()  # nothing of this server's
     # What is left, from Gym's agents: the policy's URL carries Gym's own path names, the rollout prefix from rollout

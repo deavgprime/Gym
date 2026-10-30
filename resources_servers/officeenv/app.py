@@ -39,7 +39,9 @@ instead of through the model's context. Their own content tools keep it out too
 (``sandbox_config.inline_file_bytes``): a download saves the file in the workspace
 (``<app folder>/<file id>/<name>``, ``FILE_APPS``) and answers with its path, carrying the content
 only for short text, and an upload that pastes binary content or long text is refused with the file
-API command that sends the file instead.
+API command that sends the file instead. Gmail's attachments move through the workspace as well:
+``get_attachment`` saves one there, and a message or draft attaches a workspace file by its path
+(``{"path": ...}``), which the server reads from the sandbox before the call runs.
 
 What a sandbox reads of this server names a company's API, never the environment behind it or Gym:
 the variables, routes, guide, answers and session cookie (``get_session_cookie_name``), and with the
@@ -69,8 +71,9 @@ import os
 import posixpath
 import shlex
 import socket
+import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from functools import cache
@@ -83,10 +86,10 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from officeenv.apps import available, get_app_class
 from officeenv.artifacts import ArtifactStore
-from officeenv.errors import InvalidRequest
+from officeenv.errors import InvalidRequest, NotFound
 from officeenv.exposure import Catalog, ToolsExposure
 from officeenv.exposure.base import Invocation
-from officeenv.service import EpisodeService, Reply
+from officeenv.service import EpisodeService, Reply, parse_arguments
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from nemo_gym.base_resources_server import (
@@ -166,8 +169,9 @@ class OfficeEnvSandboxConfig(SandboxConfig):
         description="Keep the file apps' content (Google Drive, Box, SharePoint, OneDrive) out of the conversation: "
         "a download saves the file in the workspace under the app's folder and answers with its path, carrying the "
         "content only for a text file of at most this many bytes; an upload that pastes binary content, or text over "
-        "this many bytes, is refused with the file API command that sends the file. None answers and takes content "
-        "in full, as without a sandbox",
+        "this many bytes, is refused with the file API command that sends the file. Gmail's attachments too: "
+        "get_attachment saves one in the workspace, and a message or draft attaches a workspace file by its path. "
+        "None answers and takes content in full, as without a sandbox",
     )
 
     @model_validator(mode="after")
@@ -392,23 +396,36 @@ the apps' tools takes pasted content only as text of at most {limit} bytes: send
 with the commands above.
 """
 
+MAIL_GUIDE = """Mail attachments move through this workspace too. Getting one ({get}) saves it at
+gmail/<message id>/<attachment id>/<name> (the answer's savedTo). A message or draft attaches a
+workspace file by its path, as the attachment {{"path": "{workdir}/totals.xlsx"}} (named after the
+file unless you give a filename); pasted attachment content is taken only as text of at most {limit}
+bytes.
+"""
+GET_ATTACHMENT = "Gmail's get_attachment tool"
+
 
 def workspace_guide(
-    content_limit: int | None = DEFAULT_INLINE_FILE_BYTES, apps: tuple[str, ...] = tuple(FILE_APPS)
+    content_limit: int | None = DEFAULT_INLINE_FILE_BYTES, apps: tuple[str, ...] = (), *, workdir: str = "/workspace"
 ) -> str:
-    """The workspace guide for an episode whose file ``apps`` (FILE_APPS) are connected: how files move, and where
-    downloads land when file content stays out of the conversation (``content_limit``, see ContentInWorkspace; None:
-    it does not)."""
-    shown = [FILE_APPS[app] for app in apps]
+    """The workspace guide for an episode that connects ``apps``: how files move between the workspace and its file
+    apps (those of ``apps`` in FILE_APPS, all of them for an episode that connects none), where downloads land when
+    file content stays out of the conversation (``content_limit``, see ContentInWorkspace; None: it does not), and
+    then, for an episode that connects Gmail, how its attachments move too."""
+    names = [app for app in FILE_APPS if app in apps] or list(FILE_APPS)
+    shown = [FILE_APPS[app] for app in names]
     guide = FILES_GUIDE.format(
-        codes=", ".join(f"{app} ({FILE_APPS[app].label})" for app in apps),
+        codes=", ".join(f"{app} ({FILE_APPS[app].label})" for app in names),
         notes="".join(f"{spec.label}: {spec.note}.\n" for spec in shown),
     )
     if content_limit is None:
         return guide
     width = max(len(f"{spec.folder}/<file id>/<name>") for spec in shown) + 3
     folders = "\n".join(f"    {f'{spec.folder}/<file id>/<name>':<{width}}{spec.label}" for spec in shown)
-    return guide + "\n" + CONTENT_GUIDE.format(folders=folders, limit=content_limit)
+    guide += "\n" + CONTENT_GUIDE.format(folders=folders, limit=content_limit)
+    if "gmail" in apps:
+        guide += "\n" + MAIL_GUIDE.format(get=GET_ATTACHMENT, workdir=workdir, limit=content_limit)
+    return guide
 
 
 # The file apps' ops that answer a file's content, and those that take content to store. In a sandboxed episode the
@@ -416,6 +433,16 @@ def workspace_guide(
 # tokens on every later request, and a model that copies them by hand gets them wrong.
 CONTENT_DOWNLOADS = frozenset((app, op) for app, spec in FILE_APPS.items() for op in spec.downloads)
 CONTENT_UPLOADS = frozenset((app, op) for app, spec in FILE_APPS.items() for op in spec.uploads)
+# Gmail keeps attachments in its messages, with no file API: they move through the workspace too
+# (ContentInWorkspace). get_attachment saves one there, at gmail/<message id>/<attachment id>/<name>, and a message
+# or draft attaches a workspace file by its path ({"path": ...}), which the tool route reads from the sandbox before
+# the call runs (OfficeEnvResourcesServer._read_attachments) and the call carries as the attachment's content.
+MAIL_FOLDER = "gmail"
+ATTACHMENT_DOWNLOADS = frozenset({("gmail", "get_attachment")})
+ATTACHMENT_UPLOADS = frozenset({("gmail", "send_message"), ("gmail", "create_draft"), ("gmail", "update_draft")})
+DOWNLOAD_FOLDERS = {app: spec.folder for app, spec in FILE_APPS.items()} | {"gmail": MAIL_FOLDER}
+CONTENT_KEYS = frozenset({"content", "content_base64", "contentBase64"})  # an attachment's content, as Gmail takes it
+UNREADABLE_PATHS = ("/dev/", "/proc/", "/sys/")  # no attachment is read from these
 PREVIEW_CHARS = 2000  # the start of a text file too long to answer inline
 EXPORT_EXTENSIONS = {
     "text/plain": ".txt",
@@ -491,18 +518,52 @@ CONTENT_DESCRIPTIONS: dict[tuple[str, str], str] = {
         "version (conflict_behavior replace, the default), or the call fails (fail) or the upload is renamed "
         "(rename). " + _PASTED
     ),
+    ("gmail", "get_attachment"): (
+        "Get an attachment of a message in your mailbox (or of your draft), saved in the workspace: " + _SAVED
+    ),
+}
+
+_ATTACHED = (
+    "{{path, filename?, mimeType?}} attaches a file from the workspace (its path, e.g. {workdir}/totals.xlsx; the "
+    "filename defaults to the file's name), and {{filename, content, mimeType?}} text of at most {limit} bytes; any "
+    "other file goes by its path. Unknown fields are refused."
+)
+# Gmail's attachment parameters as a sandboxed episode reads them (ContentInWorkspace), in place of OfficeEnv's, which
+# take content or content_base64. Formatted with the limit and the workspace, as CONTENT_DESCRIPTIONS.
+PARAM_DESCRIPTIONS: dict[tuple[str, str, str], str] = {
+    ("gmail", "send_message", "attachments"): "Attachments: " + _ATTACHED,
+    ("gmail", "create_draft", "attachments"): "Attachments: " + _ATTACHED,
+    ("gmail", "update_draft", "attachments"): "New attachments (replaces): " + _ATTACHED,
 }
 
 
 def content_description(app: str, op: str, description: str, limit: int | None, *, guide: str) -> str:
-    """A tool's description as a sandboxed episode reads it: the file apps' content ops say what they do there
-    (CONTENT_DESCRIPTIONS, ``guide`` the workspace guide's path); every other op, and every op when content moves
-    through the conversation (``limit`` None), keeps OfficeEnv's. The tool's app label (``[Google Drive] ``) stays."""
+    """A tool's description as a sandboxed episode reads it: the file apps' content ops and Gmail's get_attachment
+    say what they do there (CONTENT_DESCRIPTIONS, ``guide`` the workspace guide's path); every other op, and every
+    op when content moves through the conversation (``limit`` None), keeps OfficeEnv's. The tool's app label
+    (``[Google Drive] ``) stays."""
     text = CONTENT_DESCRIPTIONS.get((app, op))
     if text is None or limit is None:
         return description
     label = description[: description.index("] ") + 2] if description.startswith("[") and "] " in description else ""
     return label + text.format(limit=limit, guide=guide)
+
+
+def content_schema(
+    app: str, op: str, schema: Mapping[str, Any], limit: int | None, *, workdir: str = "/workspace"
+) -> Mapping[str, Any]:
+    """An op's parameter schema as a sandboxed episode reads it: Gmail's attachments described as they move there
+    (PARAM_DESCRIPTIONS, ``workdir`` the workspace); every other schema, and every one when content moves through
+    the conversation (``limit`` None), is OfficeEnv's. The schema given is not changed."""
+    changed = {param: text for (a, o, param), text in PARAM_DESCRIPTIONS.items() if (a, o) == (app, op)}
+    properties = schema.get("properties")
+    if limit is None or not changed or not isinstance(properties, Mapping):
+        return schema
+    properties = dict(properties)
+    for param, text in changed.items():
+        if isinstance(properties.get(param), Mapping):
+            properties[param] = {**properties[param], "description": text.format(limit=limit, workdir=workdir)}
+    return {**schema, "properties": properties}
 
 
 def _path_part(name: Any, fallback: str) -> str:
@@ -527,7 +588,10 @@ def _preview(text: str) -> str:
 
 
 def _version_folder(app: str, op: str, params: Mapping[str, Any], answer: Mapping[str, Any]) -> str | None:
-    """The folder under a file's own that keeps the download of one of its revisions or versions, if it is one."""
+    """The folder under a file's own that keeps the download of one of its revisions or versions, if it is one, or of
+    a mail attachment, under its message's."""
+    if (app, op) == ("gmail", "get_attachment"):  # a message may hold two attachments of one name
+        return _path_part(answer.get("attachmentId") or params.get("attachment_id"), "attachment")
     if (app, op) == ("gdrive", "get_revision"):
         return f"revisions/{_path_part(answer.get('version'), 'revision')}"
     if (app, op) == ("box", "get_file_content") and params.get("version_id"):
@@ -639,7 +703,9 @@ def download_identity(
     world: Any, app: str, op: str, params: Mapping[str, Any], answer: Mapping[str, Any]
 ) -> tuple[str, str | None]:
     """The id and name of the file a content download is of: the answer's own, but for a revision or version, whose
-    answer names neither, the file's row in the session's world."""
+    answer names neither, the file's row in the session's world, and for a mail attachment its message."""
+    if (app, op) == ("gmail", "get_attachment"):
+        return str(params.get("message_id") or "message"), answer.get("filename")
     if (app, op) == ("gdrive", "get_revision"):
         file_id = str(params.get("file_id") or "")
         return file_id, _rows(world, "gdrive", "files").get(file_id, {}).get("name")
@@ -713,15 +779,101 @@ def pasted_content_refusal(
     )
 
 
+def attachment_path(value: Any, workdir: str) -> str | None:
+    """The sandbox path an attachment's ``path`` names, normalized (a relative one is in the workdir); None for one
+    that names nothing a file can be read from (empty, or under /dev, /proc or /sys)."""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return None
+    path = "/" + posixpath.normpath(text if text.startswith("/") else f"{workdir}/{text}").lstrip("/")
+    return None if path.startswith(UNREADABLE_PATHS) else path
+
+
+def copied_file(local: Path, limit: int) -> bytes | str:
+    """A file a sandbox provider copied to this host: its bytes when it is a regular file of at most ``limit``
+    bytes, else why not: "too_large", or "missing" for nothing there, a folder, a device, a pipe or a link, whose
+    copy would be read here, not in the sandbox (``docker cp`` copies a link as a link)."""
+    try:
+        info = local.lstat()
+    except OSError:
+        return "missing"
+    if not stat.S_ISREG(info.st_mode):
+        return "missing"
+    return "too_large" if info.st_size > limit else local.read_bytes()
+
+
+def mail_attachments(
+    items: Any, *, limit: int, read: Mapping[str, bytes | str], workdir: str, guide: str
+) -> tuple[list[Any], int, int]:
+    """A sandboxed episode's mail attachments as Gmail takes them, with how many workspace files they carry and their
+    bytes. An attachment that names a workspace file by its path carries the file's content (UTF-8 text as
+    ``content``, other bytes as ``content_base64``), read beforehand by the route (``read``: path -> its bytes, or
+    why there are none). One that pastes binary content, or text over ``limit`` bytes, is refused
+    (``upload_from_workspace``), and so is one that names a file without its content (``attach_from_workspace``):
+    each refusal gives the attachment that names the workspace file instead (``guide`` the workspace guide's path)."""
+    out: list[Any] = []
+    files = size = 0
+    for item in items if isinstance(items, list) else [items]:
+        fields = item if isinstance(item, Mapping) else {}
+        if "path" in fields:
+            if CONTENT_KEYS & set(fields):
+                raise InvalidRequest(
+                    "attachments: give a file's path or its content, not both", code="invalidArgument"
+                )
+            path = attachment_path(fields["path"], workdir)
+            data = read.get(path) if path is not None else None
+            if data == "too_large":
+                raise InvalidRequest(
+                    f"attachments: {path} is over {MAX_UPLOAD_BYTES // 1_000_000} MB", code="invalidArgument"
+                )
+            if not isinstance(data, bytes):
+                raise NotFound(f"attachments: there is no file at {path or fields['path']} in the workspace")
+            entry = {key: value for key, value in fields.items() if key != "path"}
+            if not (entry.get("filename") or entry.get("name")):
+                entry["filename"] = posixpath.basename(path)
+            try:
+                entry["content"] = data.decode("utf-8")
+            except UnicodeDecodeError:
+                entry["content_base64"] = base64.b64encode(data).decode("ascii")
+            out.append(entry)
+            files, size = files + 1, size + len(data)
+            continue
+        name = item if isinstance(item, str) else fields.get("filename") or fields.get("name") or "<file>"
+        content = fields.get("content")
+        use = json.dumps({"path": f"{workdir}/{name}"})
+        if fields.get("content_base64", fields.get("contentBase64")) is not None:
+            held = "binary content"
+        elif isinstance(content, str) and len(content.encode("utf-8")) > limit:
+            held = f"text over {limit} bytes"
+        elif content is None:
+            raise InvalidRequest(
+                f"attachments: {name!r} carries no content. Attach a file from the workspace by its path ({guide}): "
+                f"{use}",
+                code="attach_from_workspace",
+            )
+        else:
+            out.append(item)
+            continue
+        raise InvalidRequest(
+            f"Attachment content is not pasted into a call in this sandbox ({held}). Write the file in the workspace "
+            f"and attach it by its path ({guide}): {use}",
+            code="upload_from_workspace",
+        )
+    return out, files, size
+
+
 class ContentInWorkspace:
-    """A sandboxed episode's exposure with the file apps' content kept out of the conversation; everything else is
-    the session's own exposure, which it wraps. A download saves the file in the workspace and answers with its
-    path (``saved_download``), and an upload that pastes its content is refused with the file API command that
-    sends the file (``pasted_content_refusal``, an app error the session answers as any other). Saving is the
-    route's: ``format_result`` queues the file on the episode, and the tool route writes it into the sandbox before
-    it answers (``OfficeEnvResourcesServer._save_downloads``). The file API's own calls (``_Episode.direct``) pass
-    as they are, and an error they meet is kept with its HTTP status for the file API to answer with. With no
-    ``limit``, content moves through the conversation and only the file API's errors are kept."""
+    """A sandboxed episode's exposure with the file apps' content, and Gmail's attachments, kept out of the
+    conversation; everything else is the session's own exposure, which it wraps. A download saves the file in the
+    workspace and answers with its path (``saved_download``), and an upload that pastes its content is refused with
+    the file API command that sends the file (``pasted_content_refusal``, an app error the session answers as any
+    other). A message's attachment that names a workspace file by its path carries that file
+    (``mail_attachments``); pasted attachment content is refused the same way. Moving bytes is the route's:
+    ``format_result`` queues a download on the episode, which the tool route writes into the sandbox before it
+    answers (``OfficeEnvResourcesServer._save_downloads``), and the route reads the files a call attaches before it
+    runs (``attachment_paths``, ``_Episode.attached``). The file API's own calls (``_Episode.direct``) pass as they
+    are, and an error they meet is kept with its HTTP status for the file API to answer with. With no ``limit``,
+    content moves through the conversation and only the file API's errors are kept."""
 
     def __init__(
         self, inner: Any, episode: "_Episode", *, limit: int | None, folder: str, guide: str, world: Any
@@ -738,26 +890,67 @@ class ContentInWorkspace:
             raise AttributeError(name)
         return getattr(self._inner, name)
 
+    def attachment_paths(self, tool_name: str, args: Any) -> list[str]:
+        """The workspace files a call's mail attachments name by path, for the route to read before the call runs;
+        none for any other call, one that does not parse, or when content moves through the conversation. Parsing is
+        the session exposure's own, which has no effects (refusals and counts are this wrapper's, in ``parse``)."""
+        raw = args if isinstance(args, (bytes, str)) else json.dumps(args)
+        if self._limit is None or (b"path" if isinstance(raw, bytes) else "path") not in raw:
+            return []
+        if isinstance(args, (bytes, str)):
+            try:
+                args = parse_arguments(args)
+            except (ValueError, RecursionError):
+                return []
+        if not isinstance(args, dict):
+            return []
+        try:
+            parsed = self._inner.parse(tool_name, args)
+        except Exception:  # the call itself answers with the error
+            return []
+        if not isinstance(parsed, Invocation) or (parsed.app, parsed.op) not in ATTACHMENT_UPLOADS:
+            return []
+        items = parsed.params.get("attachments")
+        paths = []
+        for item in items if isinstance(items, list) else []:
+            path = attachment_path(item.get("path"), self._folder) if isinstance(item, Mapping) else None
+            if path is not None and path not in paths:
+                paths.append(path)
+        return paths
+
     def parse(self, tool_name: str, args: dict[str, Any]) -> Any:
         parsed = self._inner.parse(tool_name, args)
-        if (
-            self._limit is not None
-            and isinstance(parsed, Invocation)
-            and (parsed.app, parsed.op) in CONTENT_UPLOADS
-            and not self._episode.direct
-        ):
+        if self._limit is None or not isinstance(parsed, Invocation) or self._episode.direct:
+            return parsed
+        if (parsed.app, parsed.op) in CONTENT_UPLOADS:
             refusal = pasted_content_refusal(
                 parsed.app, parsed.op, parsed.params, self._limit, guide=self._guide, world=self._world
             )
             if refusal is not None:
                 self._episode.uploads_refused += 1
                 raise InvalidRequest(refusal, code="upload_from_workspace")
+        elif (parsed.app, parsed.op) in ATTACHMENT_UPLOADS and parsed.params.get("attachments") is not None:
+            try:
+                attachments, files, size = mail_attachments(
+                    parsed.params["attachments"],
+                    limit=self._limit,
+                    read=self._episode.attached,
+                    workdir=self._folder,
+                    guide=self._guide,
+                )
+            except InvalidRequest as exc:
+                if exc.code == "upload_from_workspace":
+                    self._episode.uploads_refused += 1
+                raise
+            self._episode.files_attached += files
+            self._episode.bytes_attached += size
+            parsed = replace(parsed, params={**parsed.params, "attachments": attachments})
         return parsed
 
     def format_result(self, inv: Any, result: dict[str, Any]) -> Any:
         if (
             self._limit is not None
-            and (inv.app, inv.op) in CONTENT_DOWNLOADS
+            and (inv.app, inv.op) in CONTENT_DOWNLOADS | ATTACHMENT_DOWNLOADS
             and isinstance(result, dict)
             and not self._episode.direct
         ):
@@ -767,7 +960,7 @@ class ContentInWorkspace:
                 inv.op,
                 inv.params,
                 result,
-                folder=f"{self._folder}/{FILE_APPS[inv.app].folder}",
+                folder=f"{self._folder}/{DOWNLOAD_FOLDERS[inv.app]}",
                 limit=self._limit,
                 file_id=file_id,
                 name=name,
@@ -891,13 +1084,16 @@ class _Episode:
     sandbox: AsyncSandbox | None = None
     access: SandboxAccess | None = None
     grading: bool = False
-    # Drive content kept out of the conversation (ContentInWorkspace): files saved in the workspace instead, and
-    # uploads refused for pasting their content
+    # The file apps' content and Gmail's attachments kept out of the conversation (ContentInWorkspace): files saved in
+    # the workspace instead, uploads refused for pasting their content, and workspace files attached to mail
     files_saved: int = 0
     bytes_saved: int = 0
     uploads_refused: int = 0
+    files_attached: int = 0
+    bytes_attached: int = 0
     saves: list[tuple[str, bytes]] = field(default_factory=list)  # (path, bytes) the current call saved
     folders: set[str] = field(default_factory=set)  # folders made in the sandbox for them
+    attached: dict[str, bytes | str] = field(default_factory=dict)  # the current call's attached files, or why not
     direct: bool = False  # a file API call is under way: its content moves as it is
     direct_status: int | None = None  # the HTTP status of the error that call met, if any
 
@@ -907,6 +1103,8 @@ class _Episode:
             "sandbox_files_saved": float(self.files_saved),
             "sandbox_bytes_saved": float(self.bytes_saved),
             "sandbox_uploads_refused": float(self.uploads_refused),
+            "sandbox_files_attached": float(self.files_attached),
+            "sandbox_bytes_attached": float(self.bytes_attached),
         }
 
 
@@ -1049,18 +1247,21 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
                     raise
         return ResourcesSeedSessionResponse(resources_session_id=session_id, sandbox_access=episode.access)
 
+    def _workdir(self) -> str:
+        return self.config.sandbox_config.workdir.rstrip("/")
+
     def _guide_path(self) -> str:
-        return f"{self.config.sandbox_config.workdir.rstrip('/')}/{GUIDE_NAME}"
+        return f"{self._workdir()}/{GUIDE_NAME}"
 
     def _keep_content_in_workspace(self, session_id: str, episode: _Episode) -> None:
-        """Move the episode's file content through its workspace (ContentInWorkspace), unless ``inline_file_bytes``
-        is None; either way the file API's calls answer with the app's HTTP status."""
+        """Move the episode's file content and mail attachments through its workspace (ContentInWorkspace), unless
+        ``inline_file_bytes`` is None; either way the file API's calls answer with the app's HTTP status."""
         session = self.service.store.get(session_id)
         session.exposure = ContentInWorkspace(
             session.exposure,
             episode,
             limit=self.config.sandbox_config.inline_file_bytes,
-            folder=self.config.sandbox_config.workdir.rstrip("/"),
+            folder=self._workdir(),
             guide=self._guide_path(),
             world=session.world,
         )
@@ -1071,8 +1272,8 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
         if not config.image:
             raise ValueError("Set sandbox_config.image to the episode sandbox image (see sandbox/Dockerfile)")
         named_configs = get_global_config_dict()
-        connected = tuple(app for app in FILE_APPS if any(tool.startswith(f"{app}_") for tool in episode.tools))
-        files = {self._guide_path(): workspace_guide(config.inline_file_bytes, connected or tuple(FILE_APPS))}
+        apps = tuple(self.service.store.get(session_id).apps)
+        files = {self._guide_path(): workspace_guide(config.inline_file_bytes, apps, workdir=self._workdir())}
         if config.host_relay:
             files[RELAY_PATH] = RELAY_SOURCE
         spec = config.spec(
@@ -1211,12 +1412,52 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
         if self.service.store.get(session_id) is None:
             raise ResourcesSessionLostError("No seeded OfficeEnv session for this tool call")
         episode = self._episodes.get(session_id)
+        self._require_open(episode)
+        body = await request.body()
+        attached = await self._read_attachments(session_id, episode, tool_name, body)
+        self._require_open(episode)  # verification may have begun while the call's attachments were read
+        reply = self._attaching(episode, attached, lambda: self.service.call(session_id, tool_name, body))
+        await self._save_downloads(session_id, episode)
+        return Response(content=reply.text(), media_type="application/json", status_code=reply.status)
+
+    @staticmethod
+    def _require_open(episode: _Episode | None) -> None:
+        """Refuse a call of an episode whose verification has started, from which point its tools are closed."""
         if episode is not None and episode.grading:
             # neutral words: a process the harness left running in the sandbox may read them
             raise HTTPException(status_code=409, detail="The task has ended: its tools are closed")
-        reply = self.service.call(session_id, tool_name, await request.body())
-        await self._save_downloads(session_id, episode)
-        return Response(content=reply.text(), media_type="application/json", status_code=reply.status)
+
+    async def _read_attachments(
+        self, session_id: str, episode: _Episode | None, tool_name: str, body: bytes
+    ) -> dict[str, bytes | str]:
+        """The workspace files a call's mail attachments name by path (ContentInWorkspace.attachment_paths), read from
+        the episode's sandbox before the call runs: path -> its bytes, or why there are none (``copied_file``)."""
+        session = self.service.store.get(session_id)
+        exposure = session.exposure if session is not None else None
+        if episode is None or episode.sandbox is None or not isinstance(exposure, ContentInWorkspace):
+            return {}
+        read: dict[str, bytes | str] = {}
+        for path in exposure.attachment_paths(tool_name, body):
+            with tempfile.TemporaryDirectory(prefix="officeenv-attachment-") as folder:
+                local = Path(folder) / "file"
+                try:
+                    await episode.sandbox.download(path, local)
+                except Exception as exc:  # no such file in the sandbox, or none the provider can read
+                    LOGGER.info("No attachment at %s in OfficeEnv session %s: %s", path, session_id, exc)
+                read[path] = copied_file(local, MAX_UPLOAD_BYTES)
+        return read
+
+    @staticmethod
+    def _attaching(episode: _Episode | None, attached: dict[str, bytes | str], call: Callable[[], Reply]) -> Reply:
+        """Run ``call``, the service's (synchronous) call, with the files ``_read_attachments`` read for it in reach of
+        the episode's exposure; no await comes between, so another call of the episode sees none of them."""
+        if episode is None:
+            return call()
+        episode.attached = attached
+        try:
+            return call()
+        finally:
+            episode.attached = {}
 
     async def verify(
         self, request: Request, body: OfficeEnvVerifyRequest
@@ -1247,7 +1488,8 @@ class OfficeEnvResourcesServer(SimpleResourcesServer):
         for name, tool in catalog.items():
             app, _, op = name.partition("_")
             description = content_description(app, op, tool["description"], limit, guide=self._guide_path())
-            tools.append(catchall.tool(name, tool["parameters"], description))
+            schema = content_schema(app, op, tool["parameters"], limit, workdir=self._workdir())
+            tools.append(catchall.tool(name, schema, description))
         return tools
 
     def mcp_allowed_tools_for_session(self, seed_body: dict[str, Any]) -> list[str] | None:

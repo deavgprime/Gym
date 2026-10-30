@@ -175,10 +175,21 @@ Sandbox support is opt-in: without `sandbox_provider` the server runs as above.
      `upload_file_version`, SharePoint's `upload_content`, OneDrive's `upload_file`) refuse binary
      content, and text over `inline_file_bytes` bytes, pasted into the call
      (`upload_from_workspace`), with the file API command that sends the file instead;
+   - Gmail's attachments move through the workspace too, since Gmail has no file API:
+     `get_attachment` saves one at `gmail/<message id>/<attachment id>/<name>` and answers as the
+     downloads above, and an attachment of `send_message`, `create_draft` or `update_draft` may
+     name a workspace file by its path (`{"path": "/workspace/totals.xlsx", "filename"?,
+     "mimeType"?}`; a relative path is in the workspace). The server reads that file from the
+     sandbox before the call runs (20 MB at most, a regular file only: a link the model made
+     would be read on the server's host, since `docker cp` copies links as links) and the call
+     carries its bytes. Pasted binary content, and text over `inline_file_bytes` bytes, are
+     refused (`upload_from_workspace`), and so is an attachment that names a file without its
+     content (`attach_from_workspace`), each with the attachment that names the workspace file;
    - these tools are described as they behave here, in place of OfficeEnv's words
-     (`contentBase64`, `content_base64`), and `README.md` says the same. `/verify` reports
-     `sandbox_files_saved`, `sandbox_bytes_saved` and `sandbox_uploads_refused`, over all four
-     apps.
+     (`contentBase64`, `content_base64`), Gmail's `attachments` parameter too, and `README.md`
+     says the same. `/verify` reports `sandbox_files_saved`, `sandbox_bytes_saved`,
+     `sandbox_uploads_refused`, `sandbox_files_attached` and `sandbox_bytes_attached`, over all
+     five apps.
 
    The file API, short text, calls without content and episodes without a sandbox are unchanged;
    `inline_file_bytes: null` restores full answers. The server wraps the episode's OfficeEnv
@@ -269,8 +280,8 @@ command.
 
 Known limits: Pi installs Node and its own package in every sandbox at session start (network
 access to nodejs.org and npm); token-ID capture through Pi needs a vLLM model server and is not
-validated here; the file API serves Google Drive only; OpenCode's sandbox sessions refuse MCP
-tool grants, so Pi is the harness these episodes run. What a sandbox still reads of Gym:
+validated here; OpenCode's sandbox sessions refuse MCP tool grants, so Pi is the harness these
+episodes run. What a sandbox still reads of Gym:
 
 - the policy's URL, which Gym's agents hand the harness with Gym's own path names:
   `/ng-rollout/<id>` from rollout correlation (`ROLLOUT_PATH_PREFIX`), `/training-token-capture`
