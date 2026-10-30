@@ -45,6 +45,7 @@ from resources_servers.officeenv.app import (
     OfficeEnvResourcesServerConfig,
     OfficeEnvSandboxConfig,
     _path_part,
+    content_schema,
     egress_urls,
     is_trusted_caller,
     relay_ports,
@@ -745,6 +746,25 @@ def test_tool_descriptions_and_the_guide_say_where_file_content_goes(sandboxes) 
             and "at most 8192" in guide
         )
     assert "drive/<file id>" not in workspace_guide(None)
+
+
+def test_the_uploads_content_parameters_send_a_binary_file_by_the_file_api(sandboxes) -> None:
+    catalog = tools_exposure_catalog()
+    for app, op in sorted(CONTENT_UPLOADS):
+        schema = catalog[f"{app}_{op}"]["parameters"]
+        properties = content_schema(app, op, schema, 8192)["properties"]
+        assert properties["content_base64"]["description"] == (
+            "Taken only for UTF-8 text of at most 8192 bytes: a binary file (an XLSX workbook, a PDF, an image) goes "
+            "from the workspace with the file API (/workspace/README.md), never pasted here"
+        ), (app, op)
+        assert properties["content"]["description"].startswith("Text of at most 8192 bytes; a longer or binary file")
+        assert content_schema(app, op, schema, None) == schema  # content through the conversation: OfficeEnv's
+    with mcp_client(make_server()) as client:
+        seeded = client.post("/seed_session", json=seed_body(content_spec()))
+        token = seeded.json()["resources_tools"]["headers"][NEMO_GYM_MCP_SESSION_TOKEN_HEADER]
+        listed = {tool["name"]: tool for tool in rpc(client, "tools/list", {}, token).json()["result"]["tools"]}
+    created = listed["gdrive_create_file"]["inputSchema"]["properties"]["content_base64"]["description"]
+    assert "never pasted here" in created and "base64-encoded" not in created
 
 
 def test_with_no_limit_file_content_moves_through_the_conversation(sandboxes) -> None:
