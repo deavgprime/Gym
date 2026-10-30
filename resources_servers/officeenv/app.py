@@ -574,6 +574,9 @@ EXPORT_EXTENSIONS = {
     "text/csv": ".csv",
     "text/tab-separated-values": ".tsv",
     "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
 }
 
 _SAVED = (
